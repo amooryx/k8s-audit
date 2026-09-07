@@ -1,8 +1,8 @@
-﻿# k8s-audit
+# k8s-audit
 
 > Red team security tool — authorized use only.
 
-`ash
+```bash
 python k8s_audit.py --help
 ```
 
