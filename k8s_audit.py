@@ -22,14 +22,48 @@ DANGEROUS_VERBS_RESOURCES = [
     ("*",    "*",                   "Wildcard — cluster admin equivalent"),
     ("*",    "pods",                "Full pod control"),
     ("*",    "secrets",             "Full secrets access"),
-    ("get",  "secrets",             "Read all secrets"),
-    ("list", "secrets",             "List all secrets"),
+    ("get",  "secrets",             "Read Secrets"),
+    ("list", "secrets",             "List Secrets"),
     ("*",    "clusterroles",        "Modify cluster roles"),
     ("*",    "rolebindings",        "Modify role bindings"),
-    ("exec", "pods",                "Exec into any pod"),
     ("get",  "pods/exec",           "Exec into pods"),
+    ("create", "pods/exec",         "Exec into pods"),
     ("*",    "serviceaccounts",     "Manage service accounts"),
 ]
+
+RESOURCE_API_GROUPS = {
+    "pods": {""},
+    "pods/exec": {""},
+    "secrets": {""},
+    "serviceaccounts": {""},
+    "clusterroles": {"rbac.authorization.k8s.io"},
+    "rolebindings": {"rbac.authorization.k8s.io"},
+}
+
+
+def _rule_dangerous_permissions(rule) -> set[str]:
+    verbs = rule.verbs or []
+    resources = rule.resources or []
+    api_groups = rule.api_groups or []
+    issues = set()
+    for dangerous_verb, dangerous_resource, note in DANGEROUS_VERBS_RESOURCES:
+        verb_matches = (
+            "*" in verbs if dangerous_verb == "*"
+            else dangerous_verb in verbs or "*" in verbs
+        )
+        resource_matches = (
+            "*" in resources if dangerous_resource == "*"
+            else dangerous_resource in resources or "*" in resources
+        )
+        group_matches = (
+            dangerous_resource == "*"
+            or "*" in api_groups
+            or bool(RESOURCE_API_GROUPS[dangerous_resource].intersection(api_groups))
+        )
+        if verb_matches and resource_matches and group_matches:
+            issues.add(note)
+    return issues
+
 
 def load_kube_config(kubeconfig: str | None = None):
     if not HAS_K8S:
@@ -66,27 +100,41 @@ def list_secrets(v1, namespace: str) -> list[dict]:
 
 def check_rbac(rbac_v1, namespace: str | None) -> list[dict]:
     findings = []
-    try:
-        if namespace:
-            bindings = rbac_v1.list_namespaced_role_binding(namespace)
-        else:
-            bindings = rbac_v1.list_cluster_role_binding()
+    if namespace:
+        bindings = rbac_v1.list_namespaced_role_binding(namespace).items
+    else:
+        bindings = rbac_v1.list_role_binding_for_all_namespaces().items
+        bindings += rbac_v1.list_cluster_role_binding().items
 
-        for binding in bindings.items:
-            role_ref = binding.role_ref
-            subjects = binding.subjects or []
-            for subj in subjects:
-                if subj.kind in ("ServiceAccount", "User", "Group"):
-                    for verb, resource, note in DANGEROUS_VERBS_RESOURCES:
-                        if verb in (role_ref.name, "*") or resource in (role_ref.name, "*"):
-                            findings.append({
-                                "binding": binding.metadata.name,
-                                "subject": f"{subj.kind}/{subj.name}",
-                                "role":    role_ref.name,
-                                "issue":   note,
-                            })
-    except ApiException:
-        pass
+    role_cache = {}
+    for binding in bindings:
+        role_ref = binding.role_ref
+        role_namespace = getattr(binding.metadata, "namespace", None)
+        cache_namespace = role_namespace if role_ref.kind == "Role" else None
+        cache_key = (role_ref.kind, cache_namespace, role_ref.name)
+        if cache_key not in role_cache:
+            if role_ref.kind == "Role" and role_namespace:
+                role = rbac_v1.read_namespaced_role(role_ref.name, role_namespace)
+            elif role_ref.kind == "ClusterRole":
+                role = rbac_v1.read_cluster_role(role_ref.name)
+            else:
+                continue
+            role_cache[cache_key] = role.rules or []
+
+        issues = set()
+        for rule in role_cache[cache_key]:
+            issues.update(_rule_dangerous_permissions(rule))
+        subjects = binding.subjects or []
+        for subj in subjects:
+            if subj.kind in ("ServiceAccount", "User", "Group"):
+                for issue in sorted(issues):
+                    findings.append({
+                        "binding": binding.metadata.name,
+                        "namespace": role_namespace,
+                        "subject": f"{subj.kind}/{subj.name}",
+                        "role":    role_ref.name,
+                        "issue":   issue,
+                    })
     return findings
 
 def list_pods_with_privesc(v1, namespace: str) -> list[dict]:
@@ -155,7 +203,8 @@ def main():
         rbac_findings = check_rbac(rbac_v1, args.namespace)
         print(f"[+] RBAC dangerous bindings: {len(rbac_findings)}")
         for f in rbac_findings[:10]:
-            print(f"    [!!!] {f['subject']} via {f['binding']}: {f['issue']}")
+            binding_name = f"{f['namespace']}/{f['binding']}" if f["namespace"] else f["binding"]
+            print(f"    [!!!] {f['subject']} via {binding_name}: {f['issue']}")
         results["rbac"] = rbac_findings
 
     if args.privesc or args.all:
